@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+
+name="$RC_SVCNAME"
+description="Configure system after deploying on Proxmox VE"
+
+depend() {
+	need localmount
+	before netmount networking sshd
+}
+
+start() {
+	ebegin "Starting $name"
+
+	/usr/local/sbin/prox-init
+
+	eend $rc
+}

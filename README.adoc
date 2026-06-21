@@ -1,0 +1,104 @@
+= prox-init
+:proj-name: prox-init
+:gh-name: jirutka/{proj-name}
+:version: 0.0.0
+
+prox-init is a very simple and lightweight replacement for cloud-init for virtual machines running on *Proxmox VE*.
+
+https://cloud-init.io/[cloud-init] is the de facto standard for early initialization of cloud VM instances, but it is an insanely bloated Python project that tries to do everything – complex networking, templating engines, configuration management, phone-home, vendor-specific quirks, and a mountain of other features you will never need on a Proxmox VM.
+It pulls in Python and a sprawling dependency tree just to set a hostname and resize a disk.
+For Proxmox VE virtual machines, all of that complexity is unnecessary.
+
+prox-init fills the same role – it reads NoCloud cloud-init data from the local `cidata` ISO volume and applies the configuration – but does so with:
+
+* *~300 lines of POSIX shell* – a single script you can read and understand in minutes.
+* *Minimal dependencies* – only standard system tools plus a tiny YAML parser (https://gitlab.com/tomalok/yx[yx]).
+* *No runtime* – no daemons, no Python, no templating engines. It runs once at boot and exits.
+* *Idempotent* – safe to run on every boot; already-applied configuration is skipped.
+
+If you are provisioning Alpine Linux, Debian, or any other lightweight VM on Proxmox VE and don’t want to pull in Python and the entire cloud-init stack, prox-init is for you.
+
+
+== Supported Features
+
+prox-init covers nearly all of Proxmox VE’s cloud-init support:
+
+* *Grow filesystems* – Resizes ext3, ext4, and btrfs filesystems to fill their underlying block devices (online resize).
+  Please note that it does not increase size of underlying partitions, because it’s just silly to use partitions on non-physical disks.
+* *Set hostname* – Reads the `hostname` key from user-data and sets the system hostname.
+* *Update /etc/hosts* – Adds a `127.0.1.1` entry with the FQDN and hostname.
+* *Create admin user* – Creates a local user from the `user` key in user-data, with automatic `wheel`/`sudo` group assignment.
+* *Install SSH authorized keys* – Adds keys from the `ssh_authorized_keys` list to the admin user’s `~/.ssh/authorized_keys`.
+* *Configure networking* – Writes *ifupdown* configuration from Proxmox’s network-config format. Supports static IPv4/IPv6, DHCPv4, DHCPv6, and SLAAC.
+
+The only Proxmox cloud-init features not currently supported are DNS search domains and package upgrades.
+
+
+== Requirements
+
+Runtime dependencies:
+
+* http://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html[POSIX-sh] compatible shell with `pipefail` support (e.g. Busybox ash, ZSH, bash, …)
+* https://gitlab.com/tomalok/yx[`yx`] – a minimal YAML parser
+* `blkid`, `blockdev`, and `mountpoint` (from util-linux or busybox)
+* `getent` (from libc-bin or busybox)
+* `useradd` (from shadow) or `adduser` (e.g. from busybox)
+* `dumpe2fs` and `resize2fs` (from `e2fsprogs`) – only if you use ext3/ext4 filesystems
+* `btrfs` – only if you use btrfs filesystems
+
+
+== Installation
+
+=== Manually
+
+. Clone the repository:
++
+[source, sh, subs="+attributes"]
+----
+git clone https://github.com/{gh-name}.git
+cd {proj-name}
+----
+
+. Install the script and the appropriate init service file:
++
+[source, sh]
+----
+make install
+----
++
+The init system is auto-detected.
+You can override it with the `INIT_SYSTEM` variable (`openrc` or `systemd`).
+The installation prefix can be changed via the `prefix` variable (default: `/usr/local`).
+
+. Build and install `yx` (requires C compiler and libyaml), if you don’t have it already:
++
+[source, sh]
+----
+git clone https://gitlab.com/tomalok/yx.git
+cd yx
+make install PREFIX=/usr/local
+----
+
+. Enable the service to run at boot:
++
+OpenRC::
++
+[source,sh]
+----
+rc-update add prox-init boot
+----
++
+systemd::
++
+[source,sh]
+----
+systemctl enable prox-init.service
+----
+
+. Create a cloud-init ISO image (e.g. using Proxmox VE’s web interface or `qm set`) and attach it as a CD-ROM drive to your VM.
+  prox-init will detect the `cidata` volume on next boot.
+
+
+== License
+
+This project is licensed under http://opensource.org/licenses/MIT/[MIT License].

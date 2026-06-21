@@ -1,0 +1,531 @@
+#!/bin/sh
+# vim: set ts=4 sw=4:
+# SPDX-FileCopyrightText: 2026 Jakub Jirutka <jakub@jirutka.cz>
+# SPDX-License-Identifier: MIT
+#---help---
+# Usage: prox-init [-h | --help] [-V | --version]
+#
+# A lightweight replacement for cloud-init on Proxmox VE virtual machines.
+# It reads NoCloud cloud-init data from the local 'cidata' ISO volume and
+# applies the configuration. It's idempotent, so you can run it on every boot.
+#
+# Configured settings:
+#   - Grow ext3, ext4, and btrfs filesystems (not partitions) to fill their
+#     block devices.
+#   - Set system hostname and update /etc/hosts.
+#   - Create a local admin user from user-data.
+#   - Install SSH authorized keys for the admin user.
+#   - Write ifupdown network configuration (static, DHCP, SLAAC).
+#
+# Options:
+#   -h, --help     Show this help message and exit.
+#   -V, --version  Show version information and exit.
+#
+# Exit status:
+#    0  Success
+#   10  Missing or invalid cidata datasource
+#   11  One or more setup steps failed
+#
+# Report bugs at <https://github.com/jirutka/prox-init>
+#---help---
+#
+# Requirements:
+# - yx
+# - blkid, blockdev, mountpoint (from util-linux or busybox)
+# - getent (from libc-bin or busybox)
+# - useradd or adduser
+# - dumpe2fs, resize2fs (from e2fsprogs; if ext2/3 is used)
+# - btrfs (if btrfs is used)
+set -u
+
+# If the current shell doesn't support pipefail (e.g. dash) and /bin/bash
+# exists, re-exec using bash.
+if ( set -o pipefail 2>/dev/null ); then
+	set -o pipefail
+elif [ -x /bin/bash ]; then
+	exec /bin/bash "$0" "$@"
+fi
+
+readonly PROGNAME='prox-init'
+readonly VERSION='0.0.0'
+
+# Secondary group assigned to the admin user created from cloud-init user-data.
+# If empty, the setup_user function falls back to "wheel" or "sudo".
+readonly ADMIN_GROUP=
+# Mount point for the cloud-init cidata volume.
+readonly CIDATA_MOUNT_DIR='/tmp/cidata'
+readonly SYSLOG_FACILITY='daemon'
+
+
+#------------------------- Support functions -------------------------
+
+help() {
+	local tag='#---help---'
+	sed -n "/^$tag/,/^$tag/{/^$tag/d; s/^# \\?//; p}" "$0"
+}
+
+log() {
+	local level="$1"
+	local msg="$2"
+
+	if [ -n "${JOURNAL_STREAM:-}" ]; then
+		local prio prefix
+		case "$level" in
+			err) prio=3; prefix='ERROR: ' ;;
+			warning) prio=4; prefix='WARN: ' ;;
+			*) prio=6; prefix='';;
+		esac
+		printf '<%s>%s%s\n' "$prio" "$prefix" "$msg" >&2
+	else
+		logger -s -t "$PROGNAME" -p "$SYSLOG_FACILITY.$level" "$msg"
+	fi
+}
+info() { log info "$1"; }
+warn() { log warning "$1"; }
+error() { log err "$1"; }
+
+cleanup() {
+	trap '' EXIT HUP INT TERM  # unset trap to avoid loop
+
+	mountpoint -q "$CIDATA_MOUNT_DIR" && umount "$CIDATA_MOUNT_DIR"
+	rmdir "$CIDATA_MOUNT_DIR" 2>/dev/null
+}
+
+# Finds and mounts the device labeled "cidata" (ISO 9660) to
+# $CIDATA_MOUNT_DIR as read-only.
+#
+# Returns 1 if no such device exists.
+mount_cidata() {
+	local device="$(blkid -l -t LABEL=cidata -o device)"
+	if [ -z "$device" ]; then
+		error "Device with label cidata does not exist"
+		return 1
+	fi
+	mkdir -p "$CIDATA_MOUNT_DIR"
+	mount -t iso9660 -o ro "$device" "$CIDATA_MOUNT_DIR"
+}
+
+# Verifies that the mounted cidata contains valid cloud-init user-data.
+#
+# Returns 1 if user-data is missing, unreadable, or of an unsupported type.
+check_cidata() {
+	local header
+	header=$(head -n1 "$CIDATA_MOUNT_DIR/user-data") || {
+		error "File $CIDATA_MOUNT_DIR/user-data does not exist or not readable"
+		return 1
+	}
+	case "${header%% *}" in
+		'#cloud-config') return 0;;
+		'#!'*) error 'user-data of type script is not supported'; return 1;;
+		*) error 'Unknown user-data type'; return 1;;
+	esac
+}
+
+# Wrapper around yx(1) that splits the keypath on "/" before passing it as
+# separate arguments to yx.
+_yx() {
+	IFS=/
+	yx -f "$1" $2 2>/dev/null || {
+		unset IFS
+		warn "$2 was not found in ${1##*/}"
+		return 1
+	}
+	unset IFS
+}
+
+# Gets a value or list of values from the specified YAML file.
+#
+# $1: Path to the YAML file to parse.
+# $2: A slash-separated path to the value that consists of keys or 1-based
+#     sequence indices. If it ends with "/*", all keys under the given path are
+#     enumerated and the value of each sub-key is printed. Otherwise, the
+#     single value at the given path is printed.
+#
+# Returns 1 if the keypath $1 is not found in the file.
+yaml_get() {
+	local file="$1"
+	local keypath="$2"
+
+	if [ "${keypath%/\*}" != "$keypath" ]; then
+		keypath="${keypath%/\*}"
+
+		local keys="$(_yx "$file" "$keypath")"
+		[ "$keys" ] || return 1
+
+		local key; for key in $keys; do
+			_yx "$file" "$keypath/$key"
+			echo ''
+		done
+	else
+		_yx "$file" "$keypath"
+	fi
+}
+
+# Gets a value or list of values from the cloud-init network-config YAML file.
+# See `yaml_get()`.
+get_netconfig() { yaml_get "$CIDATA_MOUNT_DIR/network-config" "$1"; }
+
+# Gets a value or list of values from the cloud-init user-data YAML file.
+# See `yaml_get()`.
+get_userdata() { yaml_get "$CIDATA_MOUNT_DIR/user-data" "$1"; }
+
+# Resizes the filesystem if it is smaller than the underlying device.
+#
+# $1: Filesystem type.
+# $2: Path of the block device.
+fs_resize_if_needed() {
+	local fs_type="$1"
+	local dev_path="$2"
+
+	local fs_size="$(fs_size "$fs_type" "$dev_path")"
+	local dev_size="$(dev_size "$dev_path")"
+
+	if [ -z "$fs_size" ] || [ -z "$dev_size" ]; then
+		warn "Failed to get size of $fs_type FS or device on $dev_path"
+
+	elif [ $fs_size -lt $dev_size ]; then
+		info "Resizing $fs_type on $dev_path from $fs_size MiB to device size $dev_size MiB"
+		fs_resize "$fs_type" "$dev_path"
+	fi
+}
+
+# Resizes the specified filesystem to fill the entire device.
+#
+# $1: Filesystem type (btrfs, ext3, ext4).
+# $2: Path of the block device.
+#
+# Returns 1 if the filesystem type is not supported.
+fs_resize() {
+	local fs_type="$1"
+	local dev_path="$2"
+
+	case "$fs_type" in
+		btrfs) btrfs filesystem resize max "$(fs_mountpoint "$dev_path")";;
+		ext*) resize2fs "$dev_path";;
+		*) return 1;;
+	esac
+}
+
+# Prints size (in megabytes) of the specified filesystem.
+fs_size() {
+	local fs_type="$1"
+	local dev_path="$2"
+
+	case "$fs_type" in
+		btrfs)
+			btrfs filesystem show --mbytes "$dev_path" \
+				| sed -En "s|.* size ([0-9]+).*path $dev_path$|\1|p"
+		;;
+		ext*)
+			# Note: df doesn't count reserved blocks, that's why we use dumpe2fs.
+			dumpe2fs -h "$dev_path" 2>/dev/null \
+				| sed -En 's/Block (count|size):\s*([0-9]+)/\2/p' \
+				| xargs \
+				| awk '{ print int($1 * $2 / 1024 / 1024) }'
+		;;
+		*) return 1;;
+	esac
+}
+
+# Prints size (in megabytes) of the specified device.
+dev_size() {
+	local dev_path="$1"
+
+	local bytes="$(blockdev --getsize64 "$dev_path")"
+	expr $bytes / 1024 / 1024
+}
+
+# Prints the first mount point of the specified device.
+fs_mountpoint() {
+	local dev_path="$1"
+
+	mount | grep "^$dev_path " | cut -d' ' -f3 | head -n1
+}
+
+# Creates, updates or deletes generated section with the given content in the
+# specified configuration file. If the content is empty string, then the
+# generated section (start/end tags and everything between) is removed.
+#
+# $1: Path of the file to modify.
+# $2: Content to be inserted into the file; reads from STDIN if not provided.
+update_config() {
+	local conf_file="$1"
+	local content="${2-"$(cat -)"}"  # if $2 is *not set*, read from STDIN
+
+	local start_tag='# BEGIN generated'
+	local end_tag='# END generated'
+
+	[ -z "$content" ] || content=$(
+		cat <<-EOF
+			$start_tag by $PROGNAME (do not modify this block)
+			$content
+			$end_tag
+		EOF
+	)
+
+	if [ -f "$conf_file" ] && grep -q "^$start_tag" "$conf_file"; then
+
+		if [ "$content" ]; then
+			content="$(printf '%s\n' "$content" | sed '$!s/$/\\/')"  # escape \n, busybox doesn't like them
+			sed -ni "/^$start_tag/ {
+					a\\$content
+					# read and discard next line and repeat until $end_tag or EOF
+					:a; n; /^$end_tag/!ba; n
+				}; p" "$conf_file"
+		else
+			# Remove start/end tags and everything between them.
+			sed -i "/^$start_tag/,/^$end_tag/d" "$conf_file"
+		fi
+
+	elif [ "$content" ]; then
+		[ -s "$conf_file" ] && printf '\n' >> "$conf_file"
+		printf '%s\n' "$content" >> "$conf_file"
+	fi
+}
+
+
+#-------------------------- Setup functions --------------------------
+
+# Iterates over mounted filesystems and expands each filesystem if it is
+# smaller than the underlying block device.
+#
+# Only ext3, ext4, and btrfs filesystems are supported; ext2 is excluded
+# because it cannot be resized online.
+#
+# NOTE: It does not increase size of underlying partitions, because it's just
+# silly to use partitions on non-physical disks.
+setup_growfs() {
+	mount | cut -d' ' -f1,5 | sort | uniq | while read dev_path fs_type; do
+		case "$fs_type" in
+			# Note: ext2 can't be resized online.
+			ext3 | ext4 | btrfs) fs_resize_if_needed "$fs_type" "$dev_path";;
+		esac
+	done
+}
+
+# Sets the system hostname from the "hostname" key in cloud-init user-data.
+#
+# The value is sanitized to contain only alphanumeric characters and hyphens.
+# If the key is missing, the function returns without making changes.
+setup_hostname() {
+	local hostname
+
+	hostname="$(get_userdata hostname)" || return 0
+
+	printf '%s\n' "${hostname%%.*}" \
+		| sed 's/[^-a-zA-Z0-9]/-/g; s/^-*//g; s/-*$//g' \
+		> /etc/hostname
+	hostname "$(cat /etc/hostname)"
+}
+
+# Updates /etc/hosts with a 127.0.1.1 entry for the current hostname and FQDN.
+#
+# The FQDN is read from the "fqdn" key in user-data; if absent, the current
+# hostname is used. If the FQDN has no domain part, ".local" is appended.
+# The value is sanitized to contain only valid hostname characters.
+setup_hosts() {
+	local hostname="$(hostname -s)"
+	local fqdn="$(get_userdata fqdn)"
+
+	fqdn="$(printf '%s\n' "${fqdn:-"$hostname"}" \
+		| sed 's/[^-a-zA-Z0-9\.]/-/g; s/^[.-]*//g; s/[.-]*$//g')"
+	case "$fqdn" in
+		*.*) ;;
+		*) fqdn="$hostname.local";;
+	esac
+
+	update_config '/etc/hosts' <<-EOF
+		127.0.1.1	${fqdn} ${hostname}
+	EOF
+}
+
+# Creates a local user account from the "user" key in cloud-init user-data.
+#
+# The user is added to $ADMIN_GROUP if set, otherwise to "wheel" or "sudo"
+# (whichever exists). If the user already exists, no action is taken.
+# If the key is missing, the function returns without making changes.
+setup_user() {
+	local user group
+
+	user="$(get_userdata 'user')" || return 0
+	id "$user" >/dev/null 2>&1 && return 0  # user already exists
+
+	info "Creating user $user"
+
+	local group=
+	if [ "${ADMIN_GROUP-}" ]; then
+		group="$ADMIN_GROUP"
+	elif getent group wheel >/dev/null; then
+		group='wheel'
+	elif getent group sudo >/dev/null; then
+		group='sudo'
+	fi
+
+	if command -v useradd >/dev/null; then
+		useradd \
+			--create-home \
+			--no-user-group \
+			--shell '/bin/bash' \
+			--password '*' \
+			${group:+--groups "$group"} \
+			"$user"
+	else  # mainly for Alpine Linux
+		adduser -D -G users "$user"
+		echo "$user:*" | chpasswd -e  # unlock account
+		if [ "$group" ]; then
+			addgroup "$user" "$group"
+		fi
+	fi
+}
+
+# Installs SSH authorized keys from the "ssh_authorized_keys" list in
+# cloud-init user-data for the configured user (or root if none is set).
+#
+# Duplicate keys are skipped. If no keys are found in user-data, the function
+# returns without changes.
+setup_ssh_keys() {
+	local keys user
+	keys="$(get_userdata 'ssh_authorized_keys/*')" || return 0
+	user="$(get_userdata 'user')" || user='root'
+
+	local homedir="$(getent passwd "$user" | cut -d: -f6)"
+	if [ -z "$homedir" ]; then
+		error "No home directory found for user $user"
+		return 1
+	fi
+
+	local auth_file="${homedir:-/root}/.ssh/authorized_keys"
+	local group="$(id -gn "$user")"
+
+	if ! [ -f "$auth_file" ]; then
+		install -m700 -o "$user" -g "$group" -d "${auth_file%/*}"
+		install -m600 -o "$user" -g "$group" /dev/null "$auth_file"
+	fi
+
+	printf '%s\n' "$keys" | while read -r key; do
+		if ! grep -Fq "$key" "$auth_file"; then
+			info "Adding SSH key to $auth_file"
+			printf '%s\n' "$key" >> "$auth_file"
+		fi
+	done
+}
+
+# Configures network interfaces from Proxmox-specific cloud-init network config.
+#
+# Supported subnet types are static, static6, dhcp4, dhcp6, and ipv6_slaac.
+# If config/1/type is not 'physical', the function warns and returns 1.
+#
+# It writes ifupdown configuration to /etc/network/interfaces.d/$iface (or
+# /etc/network/interfaces if the directory does not exist).
+#
+# NOTE: This is NOT a general cloud-init/nocloud network configuration
+# implementation; it is specifically tailored to Proxmox VE's network
+# configuration format.
+#
+# Example network-config:
+# ```
+# version: 1
+# config:
+# - type: physical
+#   name: eth0
+#   mac_address: 'ca:fe:42:2e:0f:b8'
+#   subnets:
+#   - type: static
+#     address: '192.0.2.10'
+#     netmask: '255.255.255.0'
+#     gateway: '192.0.2.1'
+#   - type: static6
+#     address: '2001:db8:beef::/64'
+#     gateway: '2001:db8:beef::1'
+# - type: nameserver
+#   address:
+#   - '1.1.1.1'
+#   search:
+#   - 'example.org'
+# ```
+setup_network() {
+	local cfgfile iface i path type inet addr mask gw
+
+	# Proxmox writes physical first and nameserver second.
+	if [ "$(get_netconfig config/1/type)" != 'physical' ]; then
+		warn "config/1/type is not 'physical', skipping networking configuration"
+		return 0
+	fi
+
+	local dns=
+	if [ "$(get_netconfig config/2/type)" = 'nameserver' ]; then
+		dns="$(get_netconfig 'config/2/address/*')"
+	fi
+
+	iface="$(get_netconfig config/1/name)" || return 1
+
+	[ -d /etc/network/interfaces.d ] \
+		&& cfgfile="/etc/network/interfaces.d/$iface" \
+		|| cfgfile="/etc/network/interfaces"
+
+	info "Writing networking config for $iface to $cfgfile"
+
+	for i in $(get_netconfig config/1/subnets); do
+		local path type inet= addr= mask= gw=
+
+		path="config/1/subnets/$i"
+
+		type="$(get_netconfig $path/type)" || continue
+		case "$type" in
+			static)
+				inet='inet'
+				addr="$(get_netconfig $path/address)" || continue
+				mask="$(get_netconfig $path/netmask)" || continue
+				gw="$(get_netconfig $path/gateway)" || :
+				dns="$(printf '%s\n' "$dns" | grep -v ':' | paste -sd ' ')"
+			;;
+			static6)
+				inet='inet6'
+				type='static'
+				addr="$(get_netconfig $path/address)" || continue
+				gw="$(get_netconfig $path/gateway)" || :
+				dns="$(printf '%s\n' "$dns" | grep ':' | paste -sd ' ')"
+			;;
+			dhcp4) inet='inet'; type='dhcp'; dns='' ;;
+			dhcp6) inet='inet6'; type='dhcp'; dns='' ;;
+			ipv6_slaac) inet='inet6'; type='auto'; dns='' ;;
+			*) warn "Unsupported subnet type: $type"; continue ;;
+		esac
+
+		[ "$i" = 1 ] && printf 'auto eth0\n'
+		printf 'iface %s %s %s\n' "$iface" "$inet" "$type"
+		[ "$addr" ] && printf '\taddress %s\n' "$addr"
+		[ "$mask" ] && printf '\tnetmask %s\n' "$mask"
+		[ "$gw" ] && printf '\tgateway %s\n' "$gw"
+		[ "$dns" ] && printf '\tdns-nameservers %s\n' "$dns"
+		true  # fix for loop exiting with non-zero
+	done | update_config "$cfgfile"
+}
+
+
+#-------------------------------- Main -------------------------------
+
+case "${1-}" in
+	-h | --help) help; exit 0 ;;
+	-V | --version) echo "$PROGNAME $VERSION"; exit 0 ;;
+esac
+
+mount_cidata || exit 10
+trap 'cleanup' EXIT
+trap 'cleanup; exit 130' HUP INT TERM
+check_cidata || exit 10
+
+rc=0
+setup_growfs || rc=11
+setup_hostname || rc=11
+setup_hosts || rc=11
+setup_user || rc=11
+setup_ssh_keys || rc=11
+
+if command -v ifup >/dev/null; then
+	setup_network || rc=11
+else
+	warn 'ifupdown was not found, skipping network configuration'
+fi
+
+exit $rc
