@@ -45,7 +45,7 @@ uninstall:
 #: Update version in the script and README.adoc to $VERSION.
 bump-version:
 	test -n "$(VERSION)"  # $$VERSION
-	$(SED) -E -i "s/^(readonly VERSION)=.*/\1='$(VERSION)'/" $(SCRIPTS_BIN) $(SCRIPTS_SBIN)
+	$(SED) -E -i "s/^(readonly VERSION)=.*/\1='$(VERSION)'/" $(SCRIPTS_SBIN)
 	$(SED) -E -i "s/^(:version:).*/\1 $(VERSION)/" README.adoc
 
 #: Bump version to $VERSION, create release commit and tag.
