@@ -1,5 +1,3 @@
-SCRIPTS_SBIN   = prox-init
-
 prefix        ?= /usr/local
 sbindir       ?= $(prefix)/sbin
 sysconfdir    ?= /etc
@@ -24,9 +22,7 @@ help:
 
 #: Install prox-init and OpenRC or systemd file (based on INIT_SYSTEM variable).
 install:
-	for script in $(SCRIPTS_SBIN); do \
-		$(INSTALL) -m 755 -D $$script "$(DESTDIR)$(sbindir)/$$script"; \
-	done
+	$(INSTALL) -m 755 -D prox-init "$(DESTDIR)$(sbindir)/prox-init"
 	case "$(INIT_SYSTEM)" in \
 		openrc) $(INSTALL) -m 755 -D dist/openrc/prox-init "$(DESTDIR)$(openrcinitdir)/prox-init" ;; \
 		systemd) $(INSTALL) -m 755 -D dist/systemd/prox-init.service "$(DESTDIR)$(systemdsystemunitdir)/prox-init.service" ;; \
@@ -34,9 +30,7 @@ install:
 
 #: Uninstall prox-init and OpenRC or systemd file (based on INIT_SYSTEM variable).
 uninstall:
-	for script in $(SCRIPTS_SBIN); do \
-		rm -f "$(DESTDIR)$(sbindir)/$$script"; \
-	done
+	rm -f "$(DESTDIR)$(sbindir)/prox-init"
 	case "$(INIT_SYSTEM)" in \
 		openrc) rm -f "$(DESTDIR)$(openrcinitdir)/prox-init" ;;
 		systemd) rm -f "$(DESTDIR)$(systemdsystemunitdir)/prox-init.service" ;; \
@@ -45,7 +39,7 @@ uninstall:
 #: Update version in the script and README.adoc to $VERSION.
 bump-version:
 	test -n "$(VERSION)"  # $$VERSION
-	$(SED) -E -i "s/^(readonly VERSION)=.*/\1='$(VERSION)'/" $(SCRIPTS_SBIN)
+	$(SED) -E -i "s/^(readonly VERSION)=.*/\1='$(VERSION)'/" prox-init
 	$(SED) -E -i "s/^(:version:).*/\1 $(VERSION)/" README.adoc
 
 #: Bump version to $VERSION, create release commit and tag.
