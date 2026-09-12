@@ -13,5 +13,5 @@ start() {
 
 	/usr/local/sbin/prox-init
 
-	eend $rc
+	eend $?
 }
