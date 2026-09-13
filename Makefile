@@ -5,7 +5,18 @@ openrcinitdir ?= $(sysconfdir)/init.d
 systemdsystemunitdir ?= $(sysconfdir)/systemd/system
 
 INIT_SYSTEM   ?= $(if $(wildcard /run/openrc),openrc,\
-                $(if $(wildcard /run/systemd/system),systemd,))
+                 $(if $(wildcard /run/systemd/system),systemd,))
+
+SVC_NAME      := prox-init
+
+ifeq ($(INIT_SYSTEM), openrc)
+SVC_FILE_SRC  := dist/openrc/prox-init
+SVC_FILE_DEST := $(DESTDIR)$(openrcinitdir)/$(SVC_NAME)
+endif
+ifeq ($(INIT_SYSTEM), systemd)
+SVC_FILE_SRC  := dist/systemd/prox-init.service
+SVC_FILE_DEST := $(DESTDIR)$(systemdsystemunitdir)/$(SVC_NAME).service
+endif
 
 INSTALL       := install
 GIT           := git
@@ -21,20 +32,18 @@ help:
 		| while read label desc; do printf '%-20s %s\n' "$$label" "$$desc"; done
 
 #: Install prox-init and OpenRC or systemd file (based on INIT_SYSTEM variable).
-install:
+install: install-common $(if $(SVC_FILE_SRC),install-service)
+
+install-common:
 	$(INSTALL) -m 755 -D prox-init "$(DESTDIR)$(sbindir)/prox-init"
-	case "$(INIT_SYSTEM)" in \
-		openrc) $(INSTALL) -m 755 -D dist/openrc/prox-init "$(DESTDIR)$(openrcinitdir)/prox-init" ;; \
-		systemd) $(INSTALL) -m 755 -D dist/systemd/prox-init.service "$(DESTDIR)$(systemdsystemunitdir)/prox-init.service" ;; \
-	esac
+
+install-service:
+	$(INSTALL) -m 755 -D $(SVC_FILE_SRC) "$(SVC_FILE_DEST)"
 
 #: Uninstall prox-init and OpenRC or systemd file (based on INIT_SYSTEM variable).
 uninstall:
 	rm -f "$(DESTDIR)$(sbindir)/prox-init"
-	case "$(INIT_SYSTEM)" in \
-		openrc) rm -f "$(DESTDIR)$(openrcinitdir)/prox-init" ;;
-		systemd) rm -f "$(DESTDIR)$(systemdsystemunitdir)/prox-init.service" ;; \
-	esac
+	$(if $(SVC_FILE_DEST),rm -f "$(SVC_FILE_DEST)")
 
 #: Update version in the script and README.adoc to $VERSION.
 bump-version:
@@ -54,4 +63,4 @@ release: .check-git-clean | bump-version
 	@test -z "$(shell $(GIT) status --porcelain)" \
 		|| { echo 'You have uncommitted changes!' >&2; exit 1; }
 
-.PHONY: help install uninstall bump-version release .check-git-clean
+.PHONY: help install install-common install-service uninstall bump-version release .check-git-clean
