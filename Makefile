@@ -1,4 +1,4 @@
-prefix        ?= /usr/local
+prefix        ?= $(or $(PREFIX),/usr/local)
 sbindir       ?= $(prefix)/sbin
 sysconfdir    ?= /etc
 openrcinitdir ?= $(sysconfdir)/init.d
