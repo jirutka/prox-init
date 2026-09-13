@@ -1,7 +1,7 @@
 = prox-init
 :proj-name: prox-init
 :gh-name: jirutka/{proj-name}
-:version: 0.0.0
+:version: 0.1.0
 
 prox-init is a very simple and lightweight replacement for cloud-init for virtual machines running on *Proxmox VE*.
 
