@@ -39,6 +39,7 @@ install-common:
 
 install-service:
 	$(INSTALL) -m 755 -D $(SVC_FILE_SRC) "$(SVC_FILE_DEST)"
+	$(SED) -E -i "s|/usr/local/sbin/|$(sbindir)/|" "$(SVC_FILE_DEST)"
 
 #: Uninstall prox-init and OpenRC or systemd file (based on INIT_SYSTEM variable).
 uninstall:
