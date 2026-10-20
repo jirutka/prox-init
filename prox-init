@@ -477,18 +477,22 @@ setup_network() {
 				addr="$(get_netconfig $path/address)" || continue
 				mask="$(get_netconfig $path/netmask)" || continue
 				gw="$(get_netconfig $path/gateway)" || :
-				dns="$(printf '%s\n' "$dns" | grep -v ':' | paste -sd ' ')"
+				dns="$(printf '%s\n' "$dns" | grep -v ':' | paste -sd ' ')"  # only IPv4
 			;;
 			static6)
 				inet='inet6'
 				type='static'
 				addr="$(get_netconfig $path/address)" || continue
 				gw="$(get_netconfig $path/gateway)" || :
-				dns="$(printf '%s\n' "$dns" | grep ':' | paste -sd ' ')"
+				dns="$(printf '%s\n' "$dns" | grep ':' | paste -sd ' ')"  # only IPv6
+			;;
+			ipv6_slaac)
+				inet='inet6'
+				type='auto'
+				dns="$(printf '%s\n' "$dns" | grep ':' | paste -sd ' ')"  # only IPv6
 			;;
 			dhcp4) inet='inet'; type='dhcp'; dns='' ;;
 			dhcp6) inet='inet6'; type='dhcp'; dns='' ;;
-			ipv6_slaac) inet='inet6'; type='auto'; dns='' ;;
 			*) warn "Unsupported subnet type: $type"; continue ;;
 		esac
 
