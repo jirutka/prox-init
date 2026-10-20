@@ -466,7 +466,7 @@ setup_network() {
 	info "Writing networking config for $iface to $cfgfile"
 
 	for i in $(get_netconfig config/1/subnets); do
-		local path type inet= addr= mask= gw=
+		local path type inet= addr= mask= gw= ns=
 
 		path="config/1/subnets/$i"
 
@@ -477,22 +477,22 @@ setup_network() {
 				addr="$(get_netconfig $path/address)" || continue
 				mask="$(get_netconfig $path/netmask)" || continue
 				gw="$(get_netconfig $path/gateway)" || :
-				dns="$(printf '%s\n' "$dns" | grep -v ':' | paste -sd ' ')"  # only IPv4
+				ns="$(printf '%s\n' "$dns" | grep -v ':' | paste -sd ' ')"  # only IPv4
 			;;
 			static6)
 				inet='inet6'
 				type='static'
 				addr="$(get_netconfig $path/address)" || continue
 				gw="$(get_netconfig $path/gateway)" || :
-				dns="$(printf '%s\n' "$dns" | grep ':' | paste -sd ' ')"  # only IPv6
+				ns="$(printf '%s\n' "$dns" | grep ':' | paste -sd ' ')"  # only IPv6
 			;;
 			ipv6_slaac)
 				inet='inet6'
 				type='auto'
-				dns="$(printf '%s\n' "$dns" | grep ':' | paste -sd ' ')"  # only IPv6
+				ns="$(printf '%s\n' "$dns" | grep ':' | paste -sd ' ')"  # only IPv6
 			;;
-			dhcp4) inet='inet'; type='dhcp'; dns='' ;;
-			dhcp6) inet='inet6'; type='dhcp'; dns='' ;;
+			dhcp4) inet='inet'; type='dhcp' ;;
+			dhcp6) inet='inet6'; type='dhcp' ;;
 			*) warn "Unsupported subnet type: $type"; continue ;;
 		esac
 
@@ -501,7 +501,7 @@ setup_network() {
 		[ "$addr" ] && printf '\taddress %s\n' "$addr"
 		[ "$mask" ] && printf '\tnetmask %s\n' "$mask"
 		[ "$gw" ] && printf '\tgateway %s\n' "$gw"
-		[ "$dns" ] && printf '\tdns-nameservers %s\n' "$dns"
+		[ "$ns" ] && printf '\tdns-nameservers %s\n' "$ns"
 		true  # fix for loop exiting with non-zero
 	done | update_config "$cfgfile"
 }
