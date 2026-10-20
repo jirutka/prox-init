@@ -55,7 +55,9 @@ readonly ADMIN_GROUP=
 # Mount point for the cloud-init cidata volume.
 readonly CIDATA_MOUNT_DIR='/tmp/cidata'
 readonly SYSLOG_FACILITY='daemon'
-
+# A newline.
+readonly NL='
+'
 
 #------------------------- Support functions -------------------------
 
@@ -410,13 +412,62 @@ setup_ssh_keys() {
 	done
 }
 
-# Configures network interfaces from Proxmox-specific cloud-init network config.
+# Writes ifupdown configuration for one physical interface to STDOUT.
+# $1: 1-based index of the interface in network-config/config.
+# $2: Interface name.
+# $3: Global DNS addresses (one per line), only for the first interface.
+render_network_iface() {
+	local idx="$1"
+	local iface="$2"
+	local dns="$3"
+	local i
+
+	for i in $(get_netconfig "config/$idx/subnets"); do
+		local path= type= inet= addr= mask= gw= ns=
+
+		path="config/$idx/subnets/$i"
+
+		type="$(get_netconfig "$path/type")" || continue
+		case "$type" in
+			static)
+				inet='inet'
+				addr="$(get_netconfig "$path/address")" || continue
+				mask="$(get_netconfig "$path/netmask")" || continue
+				gw="$(get_netconfig "$path/gateway")" || :
+				ns="$(printf '%s\n' "$dns" | grep -v ':' | paste -sd ' ')"  # only IPv4
+			;;
+			static6)
+				inet='inet6'
+				type='static'
+				addr="$(get_netconfig "$path/address")" || continue
+				gw="$(get_netconfig "$path/gateway")" || :
+				ns="$(printf '%s\n' "$dns" | grep ':' | paste -sd ' ')"  # only IPv6
+			;;
+			ipv6_slaac)
+				inet='inet6'
+				type='auto'
+				ns="$(printf '%s\n' "$dns" | grep ':' | paste -sd ' ')"  # only IPv6
+			;;
+			dhcp4) inet='inet'; type='dhcp' ;;
+			dhcp6) inet='inet6'; type='dhcp' ;;
+			*) warn "Unsupported subnet type: $type"; continue ;;
+		esac
+
+		[ "$i" = 1 ] && printf 'auto %s\n' "$iface"
+		printf 'iface %s %s %s\n' "$iface" "$inet" "$type"
+		[ "$addr" ] && printf '\taddress %s\n' "$addr"
+		[ "$mask" ] && printf '\tnetmask %s\n' "$mask"
+		[ "$gw" ] && printf '\tgateway %s\n' "$gw"
+		[ "$ns" ] && printf '\tdns-nameservers %s\n' "$ns"
+		true  # fix for loop exiting with non-zero
+	done
+}
+
+# Configures physical interfaces from Proxmox-specific cloud-init network config.
 #
 # Supported subnet types are static, static6, dhcp4, dhcp6, and ipv6_slaac.
-# If config/1/type is not 'physical', the function warns and returns 1.
-#
-# It writes ifupdown configuration to /etc/network/interfaces.d/$iface (or
-# /etc/network/interfaces if the directory does not exist).
+# Writes each interface to /etc/network/interfaces.d/$iface, or writes them
+# all to /etc/network/interfaces if interfaces.d does not exist.
 #
 # NOTE: This is NOT a general cloud-init/nocloud network configuration
 # implementation; it is specifically tailored to Proxmox VE's network
@@ -437,6 +488,11 @@ setup_ssh_keys() {
 #   - type: static6
 #     address: '2001:db8:beef::/64'
 #     gateway: '2001:db8:beef::1'
+# - type: physical
+#   name: eth1
+#   mac_address: 'ca:fe:42:2e:0f:b9'
+#   subnets:
+#   - type: dhcp4
 # - type: nameserver
 #   address:
 #   - '1.1.1.1'
@@ -444,66 +500,40 @@ setup_ssh_keys() {
 #   - 'example.org'
 # ```
 setup_network() {
-	local cfgfile iface i path type inet addr mask gw
+	local entries i
 
-	# Proxmox writes physical first and nameserver second.
-	if [ "$(get_netconfig config/1/type)" != 'physical' ]; then
-		warn "config/1/type is not 'physical', skipping networking configuration"
-		return 0
-	fi
+	entries="$(get_netconfig config)" || return 0
 
+	# Proxmox generates at most one nameserver entry, shared by all interfaces.
 	local dns=
-	if [ "$(get_netconfig config/2/type)" = 'nameserver' ]; then
-		dns="$(get_netconfig 'config/2/address/*')"
+	for i in $entries; do
+		if [ "$(get_netconfig "config/$i/type")" = 'nameserver' ]; then
+			dns="$(get_netconfig "config/$i/address/*")" || :
+			break
+		fi
+	done
+
+	local content=
+	for i in $entries; do
+		local iface cfgfile
+
+		[ "$(get_netconfig "config/$i/type")" = 'physical' ] || continue
+
+		iface="$(get_netconfig "config/$i/name")" || return 1
+		if [ -d /etc/network/interfaces.d ]; then
+			cfgfile="/etc/network/interfaces.d/$iface"
+			info "Writing networking config for $iface to $cfgfile"
+			render_network_iface "$i" "$iface" "$dns" | update_config "$cfgfile" || return 1
+		else
+			content="$content${content:+$NL$NL}$(render_network_iface "$i" "$iface" "$dns")"
+		fi
+		dns=  # proxmox DNS is global, so configure it only on the first iface
+	done
+
+	if ! [ -d /etc/network/interfaces.d ]; then
+		info 'Writing networking config to /etc/network/interfaces'
+		update_config /etc/network/interfaces "$content"
 	fi
-
-	iface="$(get_netconfig config/1/name)" || return 1
-
-	[ -d /etc/network/interfaces.d ] \
-		&& cfgfile="/etc/network/interfaces.d/$iface" \
-		|| cfgfile="/etc/network/interfaces"
-
-	info "Writing networking config for $iface to $cfgfile"
-
-	for i in $(get_netconfig config/1/subnets); do
-		local path type inet= addr= mask= gw= ns=
-
-		path="config/1/subnets/$i"
-
-		type="$(get_netconfig $path/type)" || continue
-		case "$type" in
-			static)
-				inet='inet'
-				addr="$(get_netconfig $path/address)" || continue
-				mask="$(get_netconfig $path/netmask)" || continue
-				gw="$(get_netconfig $path/gateway)" || :
-				ns="$(printf '%s\n' "$dns" | grep -v ':' | paste -sd ' ')"  # only IPv4
-			;;
-			static6)
-				inet='inet6'
-				type='static'
-				addr="$(get_netconfig $path/address)" || continue
-				gw="$(get_netconfig $path/gateway)" || :
-				ns="$(printf '%s\n' "$dns" | grep ':' | paste -sd ' ')"  # only IPv6
-			;;
-			ipv6_slaac)
-				inet='inet6'
-				type='auto'
-				ns="$(printf '%s\n' "$dns" | grep ':' | paste -sd ' ')"  # only IPv6
-			;;
-			dhcp4) inet='inet'; type='dhcp' ;;
-			dhcp6) inet='inet6'; type='dhcp' ;;
-			*) warn "Unsupported subnet type: $type"; continue ;;
-		esac
-
-		[ "$i" = 1 ] && printf 'auto eth0\n'
-		printf 'iface %s %s %s\n' "$iface" "$inet" "$type"
-		[ "$addr" ] && printf '\taddress %s\n' "$addr"
-		[ "$mask" ] && printf '\tnetmask %s\n' "$mask"
-		[ "$gw" ] && printf '\tgateway %s\n' "$gw"
-		[ "$ns" ] && printf '\tdns-nameservers %s\n' "$ns"
-		true  # fix for loop exiting with non-zero
-	done | update_config "$cfgfile"
 }
 
 
