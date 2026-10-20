@@ -11,7 +11,7 @@ For Proxmox VE virtual machines, all of that complexity is unnecessary.
 
 prox-init fills the same role – it reads NoCloud cloud-init data from the local `cidata` ISO volume and applies the configuration – but does so with:
 
-* *~300 lines of POSIX shell* – a single script you can read and understand in minutes.
+* *~330 lines of POSIX shell* – a single script you can read and understand in minutes.
 * *Minimal dependencies* – only standard system tools plus a tiny YAML parser (https://gitlab.com/tomalok/yx[yx]).
 * *No runtime* – no daemons, no Python, no templating engines. It runs once at boot and exits.
 * *Idempotent* – safe to run on every boot; already-applied configuration is skipped.

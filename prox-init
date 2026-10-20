@@ -414,13 +414,13 @@ setup_ssh_keys() {
 
 # Writes ifupdown configuration for one physical interface to STDOUT.
 # $1: 1-based index of the interface in network-config/config.
-# $2: Interface name.
-# $3: Global DNS addresses (one per line), only for the first interface.
+# $2: Global DNS addresses (one per line), only for the first interface.
 render_network_iface() {
 	local idx="$1"
-	local iface="$2"
-	local dns="$3"
-	local i
+	local dns="$2"
+	local i iface
+
+	iface="$(get_netconfig "config/$idx/name")" || return 1
 
 	for i in $(get_netconfig "config/$idx/subnets"); do
 		local path= type= inet= addr= mask= gw= ns=
@@ -466,8 +466,8 @@ render_network_iface() {
 # Configures physical interfaces from Proxmox-specific cloud-init network config.
 #
 # Supported subnet types are static, static6, dhcp4, dhcp6, and ipv6_slaac.
-# Writes each interface to /etc/network/interfaces.d/$iface, or writes them
-# all to /etc/network/interfaces if interfaces.d does not exist.
+# Writes all interfaces to /etc/network/interfaces.d/50-prox-init, or to
+# /etc/network/interfaces if interfaces.d does not exist.
 #
 # NOTE: This is NOT a general cloud-init/nocloud network configuration
 # implementation; it is specifically tailored to Proxmox VE's network
@@ -515,25 +515,19 @@ setup_network() {
 
 	local content=
 	for i in $entries; do
-		local iface cfgfile
-
-		[ "$(get_netconfig "config/$i/type")" = 'physical' ] || continue
-
-		iface="$(get_netconfig "config/$i/name")" || return 1
-		if [ -d /etc/network/interfaces.d ]; then
-			cfgfile="/etc/network/interfaces.d/$iface"
-			info "Writing networking config for $iface to $cfgfile"
-			render_network_iface "$i" "$iface" "$dns" | update_config "$cfgfile" || return 1
-		else
-			content="$content${content:+$NL$NL}$(render_network_iface "$i" "$iface" "$dns")"
+		if [ "$(get_netconfig "config/$i/type")" = 'physical' ]; then
+			content="$content${content:+$NL$NL}$(render_network_iface "$i" "$dns")" || return 1
+			dns=  # proxmox DNS is global, so configure it only on the first iface
 		fi
-		dns=  # proxmox DNS is global, so configure it only on the first iface
 	done
 
-	if ! [ -d /etc/network/interfaces.d ]; then
-		info 'Writing networking config to /etc/network/interfaces'
-		update_config /etc/network/interfaces "$content"
-	fi
+	local cfgfile
+	[ -d /etc/network/interfaces.d ] \
+		&& cfgfile='/etc/network/interfaces.d/50-prox-init' \
+		|| cfgfile='/etc/network/interfaces'
+
+	info "Writing networking config to $cfgfile"
+	update_config "$cfgfile" "$content"
 }
 
 
