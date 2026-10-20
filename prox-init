@@ -48,7 +48,7 @@ elif [ -x /bin/bash ]; then
 fi
 
 readonly PROGNAME='prox-init'
-readonly VERSION='0.1.0'
+readonly VERSION='1.0.0_rc1'
 
 # Secondary group assigned to the admin user created from cloud-init user-data.
 # If empty, the setup_user function falls back to "wheel" or "sudo".
